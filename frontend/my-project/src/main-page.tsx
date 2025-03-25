@@ -1,113 +1,85 @@
-"use client"
-
 import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Mic, MicOff, Send, Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
-//import { generateText } from "ai"
-//import { openai } from "@ai-sdk/openai"
-
-// Declare SpeechRecognition
-declare var SpeechRecognition: any
-declare var webkitSpeechRecognition: any
 
 export default function VoiceChat() {
   const [isListening, setIsListening] = useState(false)
   const [transcript, setTranscript] = useState("")
   const [messages, setMessages] = useState<{ role: "user" | "assistant"; content: string }[]>([])
   const [isLoading, setIsLoading] = useState(false)
-  //const recognitionRef = useRef<SpeechRecognition | null>(null)
+  const recognitionRef = useRef<any>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
-//   useEffect(() => {
-//     // Scroll to bottom whenever messages change
-//     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
-//   }, [messages])
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [messages])
 
-//   useEffect(() => {
-//     // Initialize speech recognition
-//     if (typeof window !== "undefined" && ("SpeechRecognition" in window || "webkitSpeechRecognition" in window)) {
-//       const SpeechRecognition = window.SpeechRecognition || webkitSpeechRecognition
-//       recognitionRef.current = new SpeechRecognition()
-//       recognitionRef.current.continuous = true
-//       recognitionRef.current.interimResults = true
+  const toggleListening = () => {
+    if (isListening) {
+      recognitionRef.current?.stop()
+      setIsListening(false)
+      if (transcript.trim()) {
+        handleSendMessage()
+      }
+    } else {
+      setTranscript("")
+      recognitionRef.current?.start()
+      setIsListening(true)
+    }
+  }
 
-//       recognitionRef.current.onresult = (event) => {
-//         const transcript = Array.from(event.results)
-//           .map((result) => result[0])
-//           .map((result) => result.transcript)
-//           .join("")
+  const handleSendMessage = async () => {
+    if (!transcript.trim()) return
 
-//         setTranscript(transcript)
-//       }
+    const userMessage = transcript.trim()
+    setMessages((prev) => [...prev, { role: "user", content: userMessage }])
+    setTranscript("")
+    setIsLoading(true)
 
-//       recognitionRef.current.onerror = (event) => {
-//         console.error("Speech recognition error", event.error)
-//         setIsListening(false)
-//       }
-//     }
-//   }, [])
+    try {
+      // Send request to Flask backend
+      const response = await fetch("http://localhost:5000/api/chat", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ message: userMessage }),
+      })
 
-//   const toggleListening = () => {
-//     if (isListening) {
-//       recognitionRef.current?.stop()
-//       setIsListening(false)
-//       if (transcript.trim()) {
-//         handleSendMessage()
-//       }
-//     } else {
-//       setTranscript("")
-//       recognitionRef.current?.start()
-//       setIsListening(true)
-//     }
-//   }
+      const data = await response.json()
 
-//   const handleSendMessage = async () => {
-//     if (!transcript.trim()) return
+      if (data.status === "success") {
+        const aiResponse = data.response
+        setMessages((prev) => [...prev, { role: "assistant", content: aiResponse }])
 
-//     const userMessage = transcript.trim()
-//     setMessages((prev) => [...prev, { role: "user", content: userMessage }])
-//     setTranscript("")
-//     setIsLoading(true)
-
-//     try {
-//       const { text } = await generateText({
-//         model: openai("gpt-4o"),
-//         prompt: userMessage,
-//         system: "You are a helpful assistant responding to voice messages. Keep responses concise and conversational.",
-//       })
-
-//       setMessages((prev) => [...prev, { role: "assistant", content: text }])
-
-//       // Read the response aloud
-//       if ("speechSynthesis" in window) {
-//         const speech = new SpeechSynthesisUtterance(text)
-//         window.speechSynthesis.speak(speech)
-//       }
-//     } catch (error) {
-//       console.error("Error generating response:", error)
-//       setMessages((prev) => [
-//         ...prev,
-//         {
-//           role: "assistant",
-//           content: "Sorry, I couldn't process that request. Please try again.",
-//         },
-//       ])
-//     } finally {
-//       setIsLoading(false)
-//     }
-//   }
+        // Read the response aloud
+        if ("speechSynthesis" in window) {
+          const speech = new SpeechSynthesisUtterance(aiResponse)
+          window.speechSynthesis.speak(speech)
+        }
+      } else {
+        throw new Error(data.message || "Unknown error")
+      }
+    } catch (error) {
+      console.error("Error generating response:", error)
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "Sorry, I couldn't process that request. Please try again." },
+      ])
+    } finally {
+      setIsLoading(false)
+    }
+  }
 
   return (
     <div className="container-fluid h-100 p-4 h-screen flex flex-col bg-gradient-to-br from-slate-900 via-purple-900/40 to-slate-900 text-white dark">
-      {/* Header */}
       <div className="py-6">
         <h1 className="text-center text-2xl font-bold bg-gradient-to-r from-purple-300 to-pink-500 text-transparent bg-clip-text">
           Voice AI Chat
         </h1>
       </div>
 
-      {/* Messages */}
       <div className="flex-1 overflow-y-auto pb-4 px-2">
         <div className="space-y-4">
           {messages.length === 0 ? (
@@ -133,13 +105,12 @@ export default function VoiceChat() {
         </div>
       </div>
 
-      {/* Center microphone section */}
       <div className="flex justify-center items-center py-12">
         <div className="relative">
           <Button
             variant={isListening ? "destructive" : "default"}
             size="icon"
-            //onClick={toggleListening}
+            onClick={toggleListening}
             disabled={isLoading}
             className={cn(
               "h-20 w-20 rounded-full shadow-lg transition-all duration-300 transform hover:scale-110",
@@ -159,24 +130,26 @@ export default function VoiceChat() {
         </div>
       </div>
 
-      {/* Input area */}
       <div className="py-4 border-t border-purple-500/20">
         <div className="flex items-center w-full gap-2">
           <div className="relative flex-1">
-            <div
+            <input
+              type="text"
+              value={transcript}
+              onChange={(e) => setTranscript(e.target.value)}
+              placeholder={isListening ? "Listening..." : "Type a message or press the microphone to speak"}
               className={cn(
-                "p-3 rounded-md border min-h-[60px] flex items-center backdrop-blur-sm",
+                "p-3 rounded-md border min-h-[60px] w-full bg-transparent backdrop-blur-sm",
                 isListening ? "border-pink-500 bg-slate-800/30" : "border-slate-700 bg-slate-800/20",
+                "focus:outline-none focus:ring-2 focus:ring-purple-500 text-white",
               )}
-            >
-              {transcript || (isListening ? "Listening..." : "Press the microphone to speak")}
-            </div>
+            />
           </div>
 
           {transcript && (
             <Button
               size="icon"
-              //onClick={handleSendMessage}
+              onClick={handleSendMessage}
               disabled={isLoading || !transcript.trim()}
               className="bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600"
             >
