@@ -1,9 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
-import { Mic, Send, Loader2 } from "lucide-react";
+import { Mic } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useReactMediaRecorder } from "react-media-recorder";
-import { createFFmpeg, fetchFile } from "@ffmpeg/ffmpeg";
+import toWav from "audiobuffer-to-wav";
 
 export default function VoiceChat() {
   const [transcript, setTranscript] = useState("");
@@ -11,34 +10,176 @@ export default function VoiceChat() {
     { role: "user" | "assistant"; content: string }[]
   >([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [status, setStatus] = useState<"idle" | "recording" | "processing">(
+    "idle"
+  );
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const recorderRef = useRef<ReturnType<typeof recordAudio> | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  const ffmpeg = createFFmpeg({ log: true });
+  const recordAudio = () => {
+    let mediaRecorder: MediaRecorder;
+    let audioChunks: Blob[] = [];
 
-  const convertToWav = async (blob: Blob): Promise<Blob> => {
-    if (!ffmpeg.isLoaded()) await ffmpeg.load();
+    return {
+      start: async (): Promise<boolean> => {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream);
 
-    ffmpeg.FS("writeFile", "input.webm", await fetchFile(blob));
-    await ffmpeg.run("-i", "input.webm", "output.wav");
-    const data = ffmpeg.FS("readFile", "output.wav");
-    return new Blob([data.buffer], { type: "audio/wav" });
+        return new Promise((resolve) => {
+          audioChunks = [];
+
+          mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) audioChunks.push(event.data);
+          };
+
+          mediaRecorder.onstart = () => resolve(true);
+
+          mediaRecorder.start();
+        });
+      },
+
+      stop: (): Promise<Blob> =>
+        new Promise((resolve) => {
+          mediaRecorder.onstop = () => {
+            const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+            resolve(audioBlob);
+          };
+          mediaRecorder.stop();
+        }),
+    };
   };
 
-  // Initialize react-media-recorder
-  const { status, startRecording, stopRecording, mediaBlobUrl, error } =
-    useReactMediaRecorder({
-      audio: true,
-      onStop: (blobUrl, blob) => handleSendAudio(blob),
-    });
+  const playAudioResponse = (audioHex: string) => {
+    try {
+      // Convert hex string to ArrayBuffer
+      const buffer = new Uint8Array(audioHex.length / 2);
+      for (let i = 0; i < audioHex.length; i += 2) {
+        buffer[i/2] = parseInt(audioHex.substr(i, 2), 16);
+      }
+
+      const audioBlob = new Blob([buffer], { type: "audio/wav" });
+      const audioUrl = URL.createObjectURL(audioBlob);
+      
+      // Clean up previous audio if exists
+      if (audioRef.current) {
+        audioRef.current.pause();
+        URL.revokeObjectURL(audioRef.current.src);
+      }
+
+      const audio = new Audio(audioUrl);
+      audioRef.current = audio;
+      
+      audio.play().catch((err) => {
+        setPlaybackError("Audio playback blocked. Click to play response.");
+        console.warn("Autoplay blocked:", err);
+      });
+      
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+        setPlaybackError(null);
+      };
+
+      console.log("Decoded buffer length:", buffer.length);
+      
+    } catch (e) {
+      console.error("Audio playback failed:", e);
+      setPlaybackError("Failed to play audio response");
+    }
+  };
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Log any recording errors
-  useEffect(() => {
-    if (error) {
+  const handleSendAudio = async (audioBlob: Blob) => {
+    if (!audioBlob || audioBlob.size === 0) {
+      console.error("Audio blob is empty or invalid");
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "No audio recorded. Please try again.",
+        },
+      ]);
+      setIsLoading(false);
+      setStatus("idle");
+      return;
+    }
+
+    setIsLoading(true);
+    setStatus("processing");
+
+    try {
+      const formData = new FormData();
+      formData.append("audio", audioBlob, "recording.wav");
+
+      const response = await fetch("http://127.0.0.1:5000/api/chat", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (data.status === "success") {
+        setMessages((prev) => [
+          ...prev,
+          { role: "user", content: data.transcript },
+          { role: "assistant", content: data.response_text },
+        ]);
+
+        if (data.audio) {
+          playAudioResponse(data.audio);
+        }
+      } else {
+        throw new Error(data.message || "Unknown error");
+      }
+    } catch (error) {
+      console.error("Error processing voice request:", error);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: `Error: Could not process audio. Please try again.`,
+        },
+      ]);
+    } finally {
+      setIsLoading(false);
+      setStatus("idle");
+    }
+  };
+
+  const toggleRecording = async () => {
+    if (!recorderRef.current) {
+      recorderRef.current = recordAudio();
+    }
+
+    const recorder = recorderRef.current;
+
+    try {
+      if (status === "recording") {
+        setStatus("processing");
+
+        const webmBlob = await recorder.stop();
+        const audioContext = new AudioContext();
+        const arrayBuffer = await webmBlob.arrayBuffer();
+        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+        const wavBuffer = toWav(audioBuffer);
+        const wavBlob = new Blob([wavBuffer], { type: "audio/wav" });
+
+        await handleSendAudio(wavBlob);
+      } else {
+        const started = await recorder.start();
+        if (started) setStatus("recording");
+      }
+    } catch (error) {
       console.error("Recording error:", error);
       setMessages((prev) => [
         ...prev,
@@ -47,160 +188,7 @@ export default function VoiceChat() {
           content: "Sorry, I couldn't record audio. Please try again.",
         },
       ]);
-      setIsLoading(false);
-    }
-  }, [error]);
-
-  const handleSendAudio = async (audioBlob: Blob) => {
-    if (!audioBlob) return;
-  
-    setIsLoading(true);
-  
-    try {
-      const wavBlob = await convertToWav(audioBlob);
-  
-      const formData = new FormData();
-      formData.append("audio", wavBlob, "recording.wav");
-  
-      const response = await fetch("http://127.0.0.1:5000/api/chat", {
-        method: "POST",
-        body: formData,
-      });
-  
-      const data = await response.json();
-  
-      if (data.status === "success") {
-        setMessages((prev) => [
-          ...prev,
-          { role: "user", content: data.transcript },
-          { role: "assistant", content: data.response_text },
-        ]);
-  
-        const audioBytes = new Uint8Array(
-          data.audio.match(/.{1,2}/g).map((byte: string) => parseInt(byte, 16))
-        );
-        const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
-        const audioUrl = URL.createObjectURL(audioBlob);
-        new Audio(audioUrl).play();
-      } else {
-        throw new Error(data.message || "Unknown error");
-      }
-    } catch (error) {
-      console.error("Error processing voice request:", error);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "Sorry, I couldn't process that. Please try again.",
-        },
-      ]);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  /*
-  const handleSendAudio = async (audioBlob: Blob) => {
-    if (!audioBlob) return;
-
-    setIsLoading(true);
-    const formData = new FormData();
-    formData.append("audio", audioBlob, "recording.wav");
-
-    try {
-      const response = await fetch("http://127.0.0.1:6000/api/chat", {
-        method: "POST",
-        body: formData,
-      });
-
-      const data = await response.json();
-
-      if (data.status === "success") {
-        setMessages((prev) => [
-          ...prev,
-          { role: "user", content: data.transcript },
-          { role: "assistant", content: data.response_text },
-        ]);
-
-        const audioBytes = new Uint8Array(
-          data.audio.match(/.{1,2}/g).map((byte: string) => parseInt(byte, 16))
-        );
-        const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const audio = new Audio(audioUrl);
-        audio.play();
-      } else {
-        throw new Error(data.message || "Unknown error");
-      }
-    } catch (error) {
-      console.error("Error processing voice request:", error);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "Sorry, I couldn't process that. Please try again.",
-        },
-      ]);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-  */
-
-  const handleSendText = async () => {
-    if (!transcript.trim()) return;
-
-    const userMessage = transcript.trim();
-    setMessages((prev) => [...prev, { role: "user", content: userMessage }]);
-    setTranscript("");
-    setIsLoading(true);
-
-    try {
-      const formData = new FormData();
-      const audioBlob = new Blob([userMessage], { type: "text/plain" });
-      formData.append("audio", audioBlob, "text.wav");
-
-      const response = await fetch("http://127.0.0.1:5000/api/chat", {
-        method: "POST",
-        body: formData,
-      });
-
-      const data = await response.json();
-
-      if (data.status === "success") {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: data.response_text },
-        ]);
-        const audioBytes = new Uint8Array(
-          data.audio.match(/.{1,2}/g).map((byte: string) => parseInt(byte, 16))
-        );
-        const audioBlob = new Blob([audioBytes], { type: "audio/wav" });
-        const audioUrl = URL.createObjectURL(audioBlob);
-        const audio = new Audio(audioUrl);
-        audio.play();
-      } else {
-        throw new Error(data.message || "Unknown error");
-      }
-    } catch (error) {
-      console.error("Error generating response:", error);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "Sorry, I couldn't process that request. Please try again.",
-        },
-      ]);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const toggleRecording = () => {
-    if (status === "recording") {
-      stopRecording();
-    } else {
-      startRecording();
+      setStatus("idle");
     }
   };
 
@@ -243,7 +231,7 @@ export default function VoiceChat() {
             variant={status === "recording" ? "destructive" : "default"}
             size="icon"
             onClick={toggleRecording}
-            disabled={isLoading || status === "acquiring_media"}
+            disabled={isLoading || status === "processing"}
             className={cn(
               "h-20 w-20 rounded-full shadow-lg transition-all duration-300 transform hover:scale-110",
               status === "recording"
@@ -262,38 +250,40 @@ export default function VoiceChat() {
         </div>
       </div>
 
+      {playbackError && (
+        <div className="text-center text-pink-400 mb-2">
+          <button 
+            onClick={() => audioRef.current?.play()}
+            className="underline"
+          >
+            {playbackError}
+          </button>
+        </div>
+      )}
+
       <div className="py-4 border-t border-purple-500/20">
         <div className="flex items-center w-full gap-2">
           <div className="relative flex-1">
             <input
               type="text"
               value={transcript}
-              onChange={(e) => setTranscript(e.target.value)}
+              readOnly
               placeholder={
                 status === "recording"
                   ? "Recording..."
-                  : "Type a message or press the microphone to speak"
+                  : status === "processing"
+                  ? "Processing..."
+                  : "Press the microphone to speak"
               }
               className={cn(
                 "p-3 rounded-md border min-h-[60px] w-full bg-transparent backdrop-blur-sm",
                 status === "recording"
                   ? "border-pink-500 bg-slate-800/30"
                   : "border-slate-700 bg-slate-800/20",
-                "focus:outline-none focus:ring-2 focus:ring-purple-500 text-white"
+                "focus:outline-none text-white"
               )}
             />
           </div>
-
-          {transcript && (
-            <Button
-              size="icon"
-              onClick={handleSendText}
-              disabled={isLoading || !transcript.trim()}
-              className="bg-gradient-to-r from-blue-500 to-cyan-500 hover:from-blue-600 hover:to-cyan-600"
-            >
-              {isLoading ? <Loader2 className="animate-spin" /> : <Send />}
-            </Button>
-          )}
         </div>
       </div>
     </div>
